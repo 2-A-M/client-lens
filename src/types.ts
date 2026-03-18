@@ -1,14 +1,24 @@
 export type Profile = {
-    id: string;
-    profileId: string;
+    address: string;
+    username: string | null;
     name?: string | null;
-    handle?: string;
-    pfp?: string;
     bio?: string | null;
-    url?: string;
+    pfp?: string | null;
 };
 
-export type BroadcastResult = {
-    id?: string;
-    txId?: string;
+export type LensPost = {
+    id: string;
+    content: string;
+    author: {
+        address: string;
+        username?: string;
+    };
+    commentOn?: { id: string } | null;
+    isDeleted: boolean;
+    timestamp?: string;
+};
+
+export type GraphQLResponse = {
+    data?: unknown;
+    errors?: Array<{ message: string }>;
 };

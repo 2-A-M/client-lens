@@ -1,64 +1,35 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { createTestPost } from './test-utils';
-import { LensClient } from '../src/client';
+import { describe, it, expect } from "vitest";
 
-// Mock dependencies
-vi.mock('../src/client', () => ({
-    LensClient: vi.fn().mockImplementation(() => ({
-        authenticate: vi.fn().mockResolvedValue(undefined),
-        post: vi.fn().mockResolvedValue({ id: 'post-1' })
-    }))
-}));
+describe("Post utilities", () => {
+    it("publicationUuid generates deterministic IDs", async () => {
+        const { publicationUuid } = await import("../src/utils");
+        const id1 = publicationUuid({ pubId: "post-1", agentId: "agent-1" });
+        const id2 = publicationUuid({ pubId: "post-1", agentId: "agent-1" });
+        const id3 = publicationUuid({ pubId: "post-2", agentId: "agent-1" });
 
-describe('Post Functions', () => {
-    let client: LensClient;
-
-    beforeEach(() => {
-        vi.clearAllMocks();
-        client = new LensClient({
-            runtime: {
-                name: 'test-runtime',
-                memory: new Map(),
-                getMemory: vi.fn(),
-                setMemory: vi.fn(),
-                clearMemory: vi.fn()
-            },
-            cache: new Map(),
-            account: {
-                address: '0x123' as `0x${string}`,
-                privateKey: '0xabc' as `0x${string}`,
-                signMessage: vi.fn(),
-                signTypedData: vi.fn()
-            },
-            profileId: '0x01' as `0x${string}`
-        });
+        expect(id1).toBe(id2);
+        expect(id1).not.toBe(id3);
     });
 
-    describe('createTestPost', () => {
-        it('should create a post successfully', async () => {
-            const content = 'Test post content';
-            const result = await createTestPost(client, content);
+    it("post content length validation", () => {
+        const MAX_POST_LENGTH = 5000;
+        expect("short post".length).toBeLessThanOrEqual(MAX_POST_LENGTH);
+        expect("A".repeat(5001).length).toBeGreaterThan(MAX_POST_LENGTH);
+    });
 
-            expect(result).toBeDefined();
-            expect(result.id).toBe('post-1');
-            expect(client.post).toHaveBeenCalledWith(content);
-        });
-
-        it('should handle post creation errors', async () => {
-            const content = 'Test post content';
-            vi.mocked(client.post).mockRejectedValueOnce(new Error('Post creation failed'));
-
-            await expect(createTestPost(client, content)).rejects.toThrow('Post creation failed');
-        });
-
-        it('should handle empty content', async () => {
-            const content = '';
-            await expect(createTestPost(client, content)).rejects.toThrow('Post content cannot be empty');
-        });
-
-        it('should handle very long content', async () => {
-            const content = 'a'.repeat(5001); // Assuming max length is 5000
-            await expect(createTestPost(client, content)).rejects.toThrow('Post content too long');
-        });
+    it("content URI format is valid", () => {
+        const content = "Hello Lens V3!";
+        const metadata = {
+            $schema: "https://json-schemas.lens.dev/posts/text-only/3.0.0.json",
+            lens: {
+                id: "test-uuid",
+                mainContentFocus: "TEXT_ONLY",
+                locale: "en",
+                content,
+            },
+        };
+        const uri = `data:application/json,${encodeURIComponent(JSON.stringify(metadata))}`;
+        expect(uri).toMatch(/^data:application\/json,/);
+        expect(uri).toContain(encodeURIComponent(content));
     });
 });

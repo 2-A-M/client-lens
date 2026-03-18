@@ -1,112 +1,84 @@
-import {
-    elizaLogger,
-    getEmbeddingZeroVector,
-    type IAgentRuntime,
-    stringToUuid,
-    type Memory,
-    type UUID,
-} from "@elizaos/core";
-import { publicationUuid } from "./utils";
-import type { LensClient } from "./client";
-import type { AnyPublicationFragment } from "@lens-protocol/client";
+/**
+ * Memory persistence helpers for Lens V3 posts.
+ */
 
-export function createPublicationMemory({
-    roomId,
-    runtime,
-    publication,
-}: {
-    roomId: UUID;
-    runtime: IAgentRuntime;
-    publication: AnyPublicationFragment;
+import {
+    type Content,
+    type IAgentRuntime,
+    type Memory,
+    stringToUuid,
+} from "@elizaos/core";
+import type { LensClient } from "./client";
+import type { LensPost } from "./types";
+import { publicationUuid } from "./utils";
+
+export function createPublicationMemory(opts: {
+    post: LensPost;
+    agentId: string;
+    roomId: string;
 }): Memory {
-    const commentOn = publication.commentOn
-        ? publicationUuid({
-              pubId: publication.commentOn.id,
-              agentId: runtime.agentId,
-          })
-        : undefined;
+    const { post, agentId, roomId } = opts;
 
     return {
-        id: publicationUuid({
-            pubId: publication.id,
-            agentId: runtime.agentId,
-        }),
-        agentId: runtime.agentId,
-        userId: runtime.agentId,
+        id: stringToUuid(
+            publicationUuid({ pubId: post.id, agentId })
+        ),
+        agentId: stringToUuid(agentId),
+        entityId: stringToUuid(post.author.address),
+        roomId: stringToUuid(roomId),
         content: {
-            text: publication.metadata.content,
+            text: post.content,
             source: "lens",
-            url: "",
-            commentOn,
-            id: publication.id,
-        },
-        roomId,
-        embedding: getEmbeddingZeroVector(),
+            url: `https://hey.xyz/posts/${post.id}`,
+            inReplyTo: post.commentOn
+                ? stringToUuid(
+                      publicationUuid({
+                          pubId: post.commentOn.id,
+                          agentId,
+                      })
+                  )
+                : undefined,
+        } as Content,
+        createdAt: post.timestamp
+            ? new Date(post.timestamp).getTime()
+            : Date.now(),
+        embedding: new Array(1536).fill(0),
     };
 }
 
-export async function buildConversationThread({
-    publication,
-    runtime,
-    client,
-}: {
-    publication: AnyPublicationFragment;
-    runtime: IAgentRuntime;
+export async function buildConversationThread(opts: {
+    post: LensPost;
     client: LensClient;
-}): Promise<AnyPublicationFragment[]> {
-    const thread: AnyPublicationFragment[] = [];
-    const visited: Set<string> = new Set();
-    async function processThread(currentPublication: AnyPublicationFragment) {
-        if (visited.has(currentPublication.id)) {
-            return;
-        }
+    runtime: IAgentRuntime;
+    agentId: string;
+    roomId: string;
+}): Promise<LensPost[]> {
+    const { post, client, runtime, agentId, roomId } = opts;
+    const thread: LensPost[] = [post];
 
-        visited.add(currentPublication.id);
+    let current = post;
+    while (current.commentOn) {
+        const parent = await client.getPublication(current.commentOn.id);
+        if (!parent) break;
 
-        const roomId = publicationUuid({
-            pubId: currentPublication.id,
-            agentId: runtime.agentId,
-        });
+        thread.unshift(parent);
 
-        // Check if the current cast has already been saved
-        const memory = await runtime.messageManager.getMemoryById(roomId);
-
-        if (!memory) {
-            elizaLogger.log(
-                "Creating memory for publication",
-                currentPublication.id
-            );
-
-            const userId = stringToUuid(currentPublication.by.id);
-
-            await runtime.ensureConnection(
-                userId,
+        // Save memory for unseen posts in the thread
+        const memoryId = stringToUuid(
+            publicationUuid({ pubId: parent.id, agentId })
+        );
+        const exists = await runtime.getMemoryById(memoryId);
+        if (!exists) {
+            const memory = createPublicationMemory({
+                post: parent,
+                agentId,
                 roomId,
-                currentPublication.by.id,
-                currentPublication.by.metadata?.displayName ||
-                    currentPublication.by.handle?.localName,
-                "lens"
-            );
-
-            await runtime.messageManager.createMemory(
-                createPublicationMemory({
-                    roomId,
-                    runtime,
-                    publication: currentPublication,
-                })
-            );
+            });
+            await runtime.createMemory(memory, "messages");
         }
 
-        thread.unshift(currentPublication);
-
-        if (currentPublication.commentOn) {
-            const parentPublication = await client.getPublication(
-                currentPublication.commentOn.id
-            );
-            if (parentPublication) await processThread(parentPublication);
-        }
+        current = parent;
     }
 
-    await processThread(publication);
     return thread;
 }

@@ -1,75 +1,92 @@
-import { type Client, type IAgentRuntime, elizaLogger, type Plugin } from "@elizaos/core";
-import { privateKeyToAccount } from "viem/accounts";
+/**
+ * Lens V3 agent client — wires LensClient, PostManager, and InteractionManager.
+ */
+
+import {
+    type IAgentRuntime,
+} from "@elizaos/core";
 import { LensClient } from "./client";
 import { LensPostManager } from "./post";
 import { LensInteractionManager } from "./interactions";
-import StorjProvider from "./providers/StorjProvider";
 
-export class LensAgentClient implements Client {
-    name = 'lens';
+export class LensAgentClient {
+    private client: LensClient;
+    private posts: LensPostManager;
+    private interactions: LensInteractionManager;
+    private runtime: IAgentRuntime;
 
-    client: LensClient;
-    posts: LensPostManager;
-    interactions: LensInteractionManager;
+    constructor(runtime: IAgentRuntime) {
+        this.runtime = runtime;
 
-    private profileId: `0x${string}`;
-    private ipfs: StorjProvider;
+        const apiKey = runtime.getSetting("LENS_API_KEY");
+        const accountAddress = runtime.getSetting("LENS_ACCOUNT_ADDRESS");
+        const privateKey = runtime.getSetting("LENS_PRIVATE_KEY");
+        const appAddress = runtime.getSetting("LENS_APP_ADDRESS");
 
-    constructor(public runtime: IAgentRuntime) {
-        const cache = new Map<string, any>();
-
-        const privateKey = runtime.getSetting(
-            "EVM_PRIVATE_KEY"
-        ) as `0x${string}`;
-        if (!privateKey) {
-            throw new Error("EVM_PRIVATE_KEY is missing");
+        if (!apiKey || !accountAddress || !privateKey || !appAddress) {
+            throw new Error(
+                "[lens] Missing required settings: LENS_API_KEY, LENS_ACCOUNT_ADDRESS, LENS_PRIVATE_KEY, LENS_APP_ADDRESS"
+            );
         }
-        const account = privateKeyToAccount(privateKey);
 
-        this.profileId = runtime.getSetting(
-            "LENS_PROFILE_ID"
-        )! as `0x${string}`;
+        const cache = new Map<string, unknown>();
 
-        this.client = new LensClient({
-            runtime: this.runtime,
-            account,
-            cache,
-            profileId: this.profileId,
+        this.client = new LensClient(runtime, cache, {
+            apiKey: apiKey as string,
+            appAddress: appAddress as string,
+            accountAddress: accountAddress as string,
+            privateKey: privateKey as string,
         });
-
-        elizaLogger.info("Lens client initialized.");
-
-        this.ipfs = new StorjProvider(runtime);
 
         this.posts = new LensPostManager(
             this.client,
-            this.runtime,
-            this.profileId,
-            cache,
-            this.ipfs
+            runtime,
+            accountAddress as string
         );
-
         this.interactions = new LensInteractionManager(
             this.client,
-            this.runtime,
-            this.profileId,
-            cache,
-            this.ipfs
+            runtime,
+            accountAddress as string
         );
     }
 
-    async start() {
-        await Promise.all([this.posts.start(), this.interactions.start()]);
+    async start(): Promise<void> {
+        const runtime = this.runtime;
 
-        return {
-            stop: async () => {
-                await Promise.all([this.posts.stop(), this.interactions.stop()]);
-            },
-        };
+        // Authenticate with Lens V3
+        const ok = await this.client.authenticate();
+        if (!ok) {
+            runtime.logger.error(
+                "[lens] Authentication failed — client will not start"
+            );
+            return;
+        }
+
+        // Load profile info
+        const profile = await this.client.getProfile();
+        if (profile) {
+            this.client.accountUsername = profile.username;
+            runtime.logger.info(
+                `[lens] Logged in as ${profile.username ?? profile.address}`
+            );
+        }
+
+        // Start post generation and interaction handling
+        await this.posts.start();
+        await this.interactions.start();
+
+        runtime.logger.info("[lens] Client started");
     }
 
-    static async start(runtime: IAgentRuntime) {
+    async stop(): Promise<void> {
+        await this.posts.stop();
+        await this.interactions.stop();
+        this.runtime.logger.info("[lens] Client stopped");
+    }
+
+    static async start(runtime: IAgentRuntime): Promise<LensAgentClient> {
         const client = new LensAgentClient(runtime);
-        return await client.start();
+        await client.start();
+        return client;
     }
 }

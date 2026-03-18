@@ -1,19 +1,24 @@
-import {
-    type Character,
-    messageCompletionFooter,
-    shouldRespondFooter,
-} from "@elizaos/core";
-import type { AnyPublicationFragment } from "@lens-protocol/client";
+import type { Character } from "@elizaos/core";
 
-export const formatPublication = (publication: AnyPublicationFragment) => {
-    return `ID: ${publication.id}
-    From: ${publication.by.metadata?.displayName} (@${publication.by.handle?.localName})${publication.by.handle?.localName})${publication.commentOn ? `\nIn reply to: @${publication.commentOn.by.handle?.localName}` : ""}
-Text: ${publication.metadata.content}`;
+// These were available in @elizaos/core v1 but not v2.
+// Inline them to avoid import errors across versions.
+const messageCompletionFooter = `\nResponse format should be formatted in a JSON block like this:
+\`\`\`json
+{ "user": "{{agentName}}", "text": "string", "action": "string" }
+\`\`\``;
+
+const shouldRespondFooter = `\nChoose one of [RESPOND, IGNORE, STOP] and write your choice only.`;
+import type { LensPost } from "./types";
+
+export const formatPublication = (post: LensPost) => {
+    return `ID: ${post.id}
+    From: ${post.author.username ?? post.author.address}${post.commentOn ? `\nIn reply to: ${post.commentOn.id}` : ""}
+Text: ${post.content}`;
 };
 
 export const formatTimeline = (
     character: Character,
-    timeline: AnyPublicationFragment[]
+    timeline: LensPost[]
 ) => `# ${character.name}'s Home Timeline
 ${timeline.map(formatPublication).join("\n")}
 `;
@@ -40,7 +45,7 @@ export const postTemplate =
     `
 # Task: Generate a post in the voice and style of {{agentName}}, aka @{{lensHandle}}
 Write a single sentence post that is {{adjective}} about {{topic}} (without mentioning {{topic}} directly), from the perspective of {{agentName}}.
-Try to write something totally different than previous posts. Do not add commentary or ackwowledge this request, just write the post.
+Try to write something totally different than previous posts. Do not add commentary or acknowledge this request, just write the post.
 
 Your response should not contain any questions. Brief, concise statements only. No emojis. Use \\n\\n (double spaces) between statements.`;
 
@@ -58,7 +63,6 @@ Thread of publications You Are Replying To:
     messageCompletionFooter;
 
 export const shouldRespondTemplate =
-    //
     `# Task: Decide if {{agentName}} should respond.
     About {{agentName}}:
     {{bio}}

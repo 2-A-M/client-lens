@@ -1,6 +1,6 @@
 {
     "name": "@elizaos-plugins/client-lens",
-    "version": "0.25.6-alpha.1",
+    "version": "1.0.0",
     "type": "module",
     "main": "dist/index.js",
     "module": "dist/index.js",
@@ -8,11 +8,9 @@
     "exports": {
         "./package.json": "./package.json",
         ".": {
-            "import": {
-                "@elizaos/source": "./src/index.ts",
-                "types": "./dist/index.d.ts",
-                "default": "./dist/index.js"
-            }
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js",
+            "default": "./dist/index.js"
         }
     },
     "files": [
@@ -21,29 +19,56 @@
     "scripts": {
         "build": "tsup --format esm --dts",
         "dev": "tsup --format esm --dts --watch",
-        "lint": "eslint --fix  --cache .",
+        "lint": "eslint --fix --cache .",
         "test": "vitest run",
         "test:watch": "vitest watch",
         "test:coverage": "vitest run --coverage"
     },
     "dependencies": {
-        "@lens-protocol/client": "2.2.0",
-        "@lens-protocol/metadata": "1.2.0",
-        "axios": "^1.7.9"
+        "ethers": "^6.13.0"
     },
     "devDependencies": {
+        "@vitest/coverage-v8": "^1.2.1",
         "tsup": "^8.3.5",
-        "vitest": "^3.0.0",
-        "@vitest/coverage-v8": "^1.2.1"
+        "typescript": "^5.9.3",
+        "vitest": "^3.0.0"
     },
     "peerDependencies": {
-        "@elizaos/core": "workspace:*"
+        "@elizaos/core": "*"
     },
     "publishConfig": {
         "access": "public"
     },
     "agentConfig": {
         "pluginType": "elizaos:client:1.0.0",
-        "pluginParameters": {}
+        "pluginParameters": {
+            "LENS_API_KEY": {
+                "type": "string",
+                "description": "Lens app Server API Key from developer.lens.xyz"
+            },
+            "LENS_ACCOUNT_ADDRESS": {
+                "type": "string",
+                "description": "Lens account address (EVM address)"
+            },
+            "LENS_PRIVATE_KEY": {
+                "type": "string",
+                "description": "Wallet private key for signing (0x + 64 hex)",
+                "sensitive": true
+            },
+            "LENS_APP_ADDRESS": {
+                "type": "string",
+                "description": "Lens app contract address from developer.lens.xyz"
+            },
+            "LENS_POLL_INTERVAL": {
+                "type": "number",
+                "description": "Seconds between mention checks (default: 120)",
+                "optional": true
+            },
+            "LENS_DRY_RUN": {
+                "type": "boolean",
+                "description": "Preview mode without posting",
+                "optional": true
+            }
+        }
     }
 }

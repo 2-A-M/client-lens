@@ -1,418 +1,490 @@
-import { type IAgentRuntime, elizaLogger } from "@elizaos/core";
-import {
-    type AnyPublicationFragment,
-    LensClient as LensClientCore,
-    production,
-    LensTransactionStatusType,
-    LimitType,
-    NotificationType,
-    type ProfileFragment,
-    PublicationType,
-    FeedEventItemType,
-} from "@lens-protocol/client";
-import type { Profile, BroadcastResult } from "./types";
-import type { PrivateKeyAccount } from "viem";
-import { getProfilePictureUri, handleBroadcastResult, omit } from "./utils";
+/**
+ * Lens Protocol V3 GraphQL client.
+ *
+ * Replaces the V2 SDK (`@lens-protocol/client`) with direct GraphQL calls
+ * to `api.lens.xyz/graphql`. Uses ethers.js for wallet-based authentication.
+ */
+
+import crypto from "node:crypto";
+import { ethers } from "ethers";
+import type { IAgentRuntime } from "@elizaos/core";
+import type { GraphQLResponse, LensPost, Profile } from "./types";
+
+const LENS_API_URL = "https://api.lens.xyz/graphql";
+const RATE_LIMIT_DELAY_MS = 500;
+const MAX_POST_LENGTH = 5000;
 
 export class LensClient {
-    runtime: IAgentRuntime;
-    account: PrivateKeyAccount;
-    cache: Map<string, any>;
-    lastInteractionTimestamp: Date;
-    profileId: `0x${string}`;
+    private runtime: IAgentRuntime;
+    private apiKey: string;
+    private appAddress: string;
+    private accountAddress: string;
+    private wallet: ethers.Wallet;
+    private accessToken: string | null = null;
+    private refreshToken: string | null = null;
+    private cache: Map<string, unknown>;
+    authenticated = false;
+    accountUsername: string | null = null;
 
-    private authenticated: boolean;
-    private authenticatedProfile: ProfileFragment | null;
-    private core: LensClientCore;
-
-    constructor(opts: {
-        runtime: IAgentRuntime;
-        cache: Map<string, any>;
-        account: PrivateKeyAccount;
-        profileId: `0x${string}`;
-    }) {
-        this.cache = opts.cache;
-        this.runtime = opts.runtime;
-        this.account = opts.account;
-        this.core = new LensClientCore({
-            environment: production,
-        });
-        this.lastInteractionTimestamp = new Date();
-        this.profileId = opts.profileId;
-        this.authenticated = false;
-        this.authenticatedProfile = null;
+    constructor(
+        runtime: IAgentRuntime,
+        cache: Map<string, unknown>,
+        opts: {
+            apiKey: string;
+            appAddress: string;
+            accountAddress: string;
+            privateKey: string;
+        }
+    ) {
+        this.runtime = runtime;
+        this.cache = cache;
+        this.apiKey = opts.apiKey;
+        this.appAddress = opts.appAddress;
+        this.accountAddress = opts.accountAddress;
+        this.wallet = new ethers.Wallet(opts.privateKey);
     }
 
-    async authenticate(): Promise<void> {
+    // -----------------------------------------------------------------------
+    // GraphQL transport
+    // -----------------------------------------------------------------------
+
+    private async graphql(
+        query: string,
+        variables: Record<string, unknown> = {},
+        authenticated = false
+    ): Promise<GraphQLResponse> {
+        await sleep(RATE_LIMIT_DELAY_MS);
+
+        const headers: Record<string, string> = {
+            "Content-Type": "application/json",
+            Origin: "https://milady.ai",
+        };
+        if (this.apiKey) headers["x-api-key"] = this.apiKey;
+        if (authenticated && this.accessToken) {
+            headers.Authorization = `Bearer ${this.accessToken}`;
+        }
+
+        const res = await fetch(LENS_API_URL, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ query, variables }),
+        });
+
+        if (!res.ok) return { errors: [{ message: `HTTP ${res.status}` }] };
+        return (await res.json()) as GraphQLResponse;
+    }
+
+    // -----------------------------------------------------------------------
+    // Authentication (3-step wallet signing)
+    // -----------------------------------------------------------------------
+
+    async authenticate(): Promise<boolean> {
         try {
-            const { id, text } =
-                await this.core.authentication.generateChallenge({
-                    signedBy: this.account.address,
-                    for: this.profileId,
-                });
+            const challengeResult = await this.graphql(
+                `mutation Challenge($request: ChallengeRequest!) {
+                    challenge(request: $request) { id text }
+                }`,
+                {
+                    request: {
+                        accountOwner: {
+                            account: this.accountAddress,
+                            app: this.appAddress,
+                            owner: this.wallet.address,
+                        },
+                    },
+                }
+            );
 
-            const signature = await this.account.signMessage({
-                message: text,
-            });
+            if (challengeResult.errors) {
+                this.runtime.logger.error(
+                    `[lens] Challenge failed: ${challengeResult.errors[0]?.message}`
+                );
+                return false;
+            }
 
-            await this.core.authentication.authenticate({ id, signature });
-            this.authenticatedProfile = await this.core.profile.fetch({
-                forProfileId: this.profileId,
-            });
+            const challenge = (
+                challengeResult.data as {
+                    challenge: { id: string; text: string };
+                }
+            ).challenge;
 
-            this.authenticated = true;
-        } catch (error) {
-            elizaLogger.error("client-lens::client error: ", error);
-            throw error;
+            const signature = await this.wallet.signMessage(challenge.text);
+
+            const authResult = await this.graphql(
+                `mutation Authenticate($request: SignedAuthChallenge!) {
+                    authenticate(request: $request) {
+                        ... on AuthenticationTokens { accessToken refreshToken }
+                        ... on WrongSignerError { reason }
+                        ... on ExpiredChallengeError { reason }
+                        ... on ForbiddenError { reason }
+                    }
+                }`,
+                { request: { id: challenge.id, signature } }
+            );
+
+            if (authResult.errors) {
+                this.runtime.logger.error(
+                    `[lens] Auth failed: ${authResult.errors[0]?.message}`
+                );
+                return false;
+            }
+
+            const auth = (
+                authResult.data as {
+                    authenticate: {
+                        accessToken?: string;
+                        refreshToken?: string;
+                        reason?: string;
+                    };
+                }
+            ).authenticate;
+
+            if (auth.accessToken) {
+                this.accessToken = auth.accessToken;
+                this.refreshToken = auth.refreshToken ?? null;
+                this.authenticated = true;
+                this.runtime.logger.info("[lens] Authentication successful");
+                return true;
+            }
+
+            this.runtime.logger.error(`[lens] Auth rejected: ${auth.reason}`);
+            return false;
+        } catch (err) {
+            this.runtime.logger.error(`[lens] Auth error: ${err}`);
+            return false;
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Publications
+    // -----------------------------------------------------------------------
 
     async createPublication(
-        contentURI: string,
-        onchain = false,
+        content: string,
         commentOn?: string
-    ): Promise<AnyPublicationFragment | null | undefined> {
-        try {
-            if (!this.authenticated) {
-                await this.authenticate();
-                elizaLogger.log("done authenticating");
-            }
-            let broadcastResult;
-
-            if (commentOn) {
-                broadcastResult = onchain
-                    ? await this.createCommentOnchain(contentURI, commentOn)
-                    : await this.createCommentMomoka(contentURI, commentOn);
-            } else {
-                broadcastResult = onchain
-                    ? await this.createPostOnchain(contentURI)
-                    : await this.createPostMomoka(contentURI);
-            }
-
-            elizaLogger.log("broadcastResult", broadcastResult);
-
-            if (broadcastResult.id) {
-                return await this.core.publication.fetch({
-                    forId: broadcastResult.id,
-                });
-            }
-
-            const completion = await this.core.transaction.waitUntilComplete({
-                forTxHash: broadcastResult.txHash,
-            });
-
-            if (completion?.status === LensTransactionStatusType.Complete) {
-                return await this.core.publication.fetch({
-                    forTxHash: completion?.txHash,
-                });
-            }
-        } catch (error) {
-            elizaLogger.error("client-lens::client error: ", error);
-            throw error;
+    ): Promise<{ hash: string | null; error?: string }> {
+        if (content.length > MAX_POST_LENGTH) {
+            return {
+                hash: null,
+                error: `Content exceeds ${MAX_POST_LENGTH} char limit`,
+            };
         }
+
+        const metadata = {
+            $schema:
+                "https://json-schemas.lens.dev/posts/text-only/3.0.0.json",
+            lens: {
+                id: crypto.randomUUID(),
+                mainContentFocus: "TEXT_ONLY",
+                locale: "en",
+                content,
+            },
+        };
+
+        const contentUri = `data:application/json,${encodeURIComponent(
+            JSON.stringify(metadata)
+        )}`;
+
+        const request: Record<string, unknown> = { contentUri };
+        if (commentOn) request.commentOn = commentOn;
+
+        const result = await this.graphql(
+            `mutation Post($request: CreatePostRequest!) {
+                post(request: $request) {
+                    ... on PostResponse { hash }
+                    ... on SponsoredTransactionRequest { reason }
+                    ... on SelfFundedTransactionRequest { reason }
+                    ... on TransactionWillFail { reason }
+                }
+            }`,
+            { request },
+            true
+        );
+
+        if (result.errors) {
+            return { hash: null, error: result.errors[0]?.message };
+        }
+
+        const data = (
+            result.data as { post?: { hash?: string; reason?: string } }
+        )?.post;
+
+        if (data?.hash) return { hash: data.hash };
+        return { hash: null, error: data?.reason ?? "Unknown error" };
     }
 
-    async getPublication(
-        pubId: string
-    ): Promise<AnyPublicationFragment | null> {
-        if (this.cache.has(`lens/publication/${pubId}`)) {
-            return this.cache.get(`lens/publication/${pubId}`);
+    async getPublication(idOrHash: string): Promise<LensPost | null> {
+        const cached = this.cache.get(`post:${idOrHash}`);
+        if (cached) return cached as LensPost;
+
+        const isHash = idOrHash.startsWith("0x");
+        const request = isHash
+            ? { txHash: idOrHash }
+            : { post: idOrHash };
+
+        const result = await this.graphql(
+            `query Post($request: PostRequest!) {
+                post(request: $request) {
+                    ... on Post {
+                        id
+                        isDeleted
+                        timestamp
+                        author { address username { localName } }
+                        metadata { ... on TextOnlyMetadata { content } }
+                        commentOn { ... on Post { id } }
+                    }
+                }
+            }`,
+            { request }
+        );
+
+        const raw = (result.data as { post?: Record<string, unknown> })?.post;
+        if (!raw) return null;
+
+        const post = rawToLensPost(raw);
+        this.cache.set(`post:${idOrHash}`, post);
+        if (post.id !== idOrHash) this.cache.set(`post:${post.id}`, post);
+        return post;
+    }
+
+    async waitForIndexing(
+        txHash: string,
+        maxAttempts = 10
+    ): Promise<LensPost | null> {
+        for (let i = 0; i < maxAttempts; i++) {
+            await sleep(2000);
+            const statusResult = await this.graphql(
+                `query TransactionStatus($request: TransactionStatusRequest!) {
+                    transactionStatus(request: $request) {
+                        ... on FinishedTransactionStatus { blockTimestamp }
+                        ... on FailedTransactionStatus { reason }
+                        ... on NotIndexedYetStatus { reason }
+                    }
+                }`,
+                { request: { txHash } }
+            );
+            const status = (
+                statusResult.data as {
+                    transactionStatus?: {
+                        blockTimestamp?: string;
+                        reason?: string;
+                    };
+                }
+            )?.transactionStatus;
+
+            if (status?.blockTimestamp && !status.reason) break;
+            if (status?.reason === "FAILED") return null;
         }
 
-        const publication = await this.core.publication.fetch({ forId: pubId });
-
-        if (publication)
-            this.cache.set(`lens/publication/${pubId}`, publication);
-
-        return publication;
+        return this.getPublication(txHash);
     }
 
     async getPublicationsFor(
-        profileId: string,
+        accountAddress: string,
         limit = 50
-    ): Promise<AnyPublicationFragment[]> {
-        const timeline: AnyPublicationFragment[] = [];
-        let next: any | undefined = undefined;
+    ): Promise<LensPost[]> {
+        const result = await this.graphql(
+            `query Posts($request: PostsRequest!) {
+                posts(request: $request) {
+                    items {
+                        ... on Post {
+                            id isDeleted timestamp
+                            author { address username { localName } }
+                            metadata { ... on TextOnlyMetadata { content } }
+                            commentOn { ... on Post { id } }
+                        }
+                    }
+                }
+            }`,
+            {
+                request: {
+                    filter: { authors: [accountAddress] },
+                    pageSize: limit > 10 ? "FIFTY" : "TEN",
+                },
+            }
+        );
 
-        do {
-            const { items, next: newNext } = next
-                ? await next()
-                : await this.core.publication.fetchAll({
-                      limit: LimitType.Fifty,
-                      where: {
-                          from: [profileId],
-                          publicationTypes: [PublicationType.Post],
-                      },
-                  });
+        const items = (
+            result.data as {
+                posts?: { items?: Array<Record<string, unknown>> };
+            }
+        )?.posts?.items ?? [];
 
-            items.forEach((publication) => {
-                this.cache.set(
-                    `lens/publication/${publication.id}`,
-                    publication
-                );
-                timeline.push(publication);
-            });
-
-            next = newNext;
-        } while (next && timeline.length < limit);
-
-        return timeline;
+        return items.map(rawToLensPost);
     }
 
-    async getMentions(): Promise<{
-        mentions: AnyPublicationFragment[];
-        next?: () => object;
-    }> {
-        if (!this.authenticated) {
-            await this.authenticate();
-        }
-        // TODO: we should limit to new ones or at least latest n
-        const result = await this.core.notifications.fetch({
-            where: {
-                highSignalFilter: false, // true,
-                notificationTypes: [
-                    NotificationType.Mentioned,
-                    NotificationType.Commented,
-                ],
-            },
-        });
-        const mentions: AnyPublicationFragment[] = [];
+    // -----------------------------------------------------------------------
+    // Notifications / Mentions
+    // -----------------------------------------------------------------------
 
-        const { items, next } = result.unwrap();
+    async getMentions(): Promise<
+        Array<{
+            id: string;
+            post: LensPost;
+        }>
+    > {
+        const result = await this.graphql(
+            `query Notifications($request: NotificationRequest!) {
+                notifications(request: $request) {
+                    items {
+                        ... on MentionNotification {
+                            id
+                            post {
+                                ... on Post {
+                                    id isDeleted timestamp
+                                    author { address username { localName } }
+                                    metadata { ... on TextOnlyMetadata { content } }
+                                    commentOn { ... on Post { id } }
+                                }
+                            }
+                        }
+                        ... on CommentNotification {
+                            id
+                            comment {
+                                ... on Post {
+                                    id isDeleted timestamp
+                                    author { address username { localName } }
+                                    metadata { ... on TextOnlyMetadata { content } }
+                                    commentOn { ... on Post { id } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }`,
+            { request: { orderBy: "DEFAULT" } },
+            true
+        );
 
-        items.map((notification) => {
-            let item;
-            if ('publication' in notification) {
-                item = notification.publication;
-            } else if ('comment' in notification) {
-                item = notification.comment;
-            } else {
-                return; // Skip notifications without the relevant properties
+        const items = (
+            result.data as {
+                notifications?: {
+                    items?: Array<{
+                        id: string;
+                        post?: Record<string, unknown>;
+                        comment?: Record<string, unknown>;
+                    }>;
+                };
             }
-            if (!item.isEncrypted) {
-                mentions.push(item);
-                this.cache.set(`lens/publication/${item.id}`, item);
-            }
-        });
+        )?.notifications?.items ?? [];
 
-        return { mentions, next };
+        return items
+            .map((item) => {
+                const raw = item.post ?? item.comment;
+                if (!raw) return null;
+                return { id: item.id, post: rawToLensPost(raw) };
+            })
+            .filter(Boolean) as Array<{ id: string; post: LensPost }>;
     }
 
-    async getProfile(profileId: string): Promise<Profile> {
-        if (this.cache.has(`lens/profile/${profileId}`)) {
-            return this.cache.get(`lens/profile/${profileId}`) as Profile;
-        }
+    // -----------------------------------------------------------------------
+    // Profiles
+    // -----------------------------------------------------------------------
 
-        const result = await this.core.profile.fetch({
-            forProfileId: profileId,
-        });
-        if (!result?.id) {
-            elizaLogger.error("Error fetching user by profileId");
+    async getProfile(address?: string): Promise<Profile | null> {
+        const addr = address ?? this.accountAddress;
+        const cached = this.cache.get(`profile:${addr}`);
+        if (cached) return cached as Profile;
 
-            throw "getProfile ERROR";
-        }
+        const result = await this.graphql(
+            `query Account($request: AccountRequest!) {
+                account(request: $request) {
+                    address
+                    username { localName }
+                    metadata { name bio picture }
+                }
+            }`,
+            { request: { address: addr } }
+        );
+
+        const raw = (
+            result.data as {
+                account?: {
+                    address: string;
+                    username?: { localName: string };
+                    metadata?: {
+                        name?: string;
+                        bio?: string;
+                        picture?: string;
+                    };
+                };
+            }
+        )?.account;
+
+        if (!raw) return null;
 
         const profile: Profile = {
-            id: "",
-            profileId,
-            name: "",
-            handle: "",
+            address: raw.address,
+            username: raw.username?.localName ?? null,
+            name: raw.metadata?.name ?? null,
+            bio: raw.metadata?.bio ?? null,
+            pfp: raw.metadata?.picture ?? null,
         };
 
-        profile.id = result.id;
-        profile.name = result.metadata?.displayName;
-        profile.handle = result.handle?.localName;
-        profile.bio = result.metadata?.bio;
-        profile.pfp = getProfilePictureUri(result.metadata?.picture);
-
-        this.cache.set(`lens/profile/${profileId}`, profile);
-
+        this.cache.set(`profile:${addr}`, profile);
         return profile;
     }
 
-    async getTimeline(
-        profileId: string,
-        limit = 10
-    ): Promise<AnyPublicationFragment[]> {
-        try {
-            if (!this.authenticated) {
-                await this.authenticate();
-            }
-            const timeline: AnyPublicationFragment[] = [];
-            let next: any | undefined = undefined;
+    // -----------------------------------------------------------------------
+    // Timeline
+    // -----------------------------------------------------------------------
 
-            do {
-                const result = next
-                    ? await next()
-                    : await this.core.feed.fetch({
-                          where: {
-                              for: profileId,
-                              feedEventItemTypes: [FeedEventItemType.Post],
-                          },
-                      });
-
-                const data = result.unwrap();
-
-                data.items.forEach((item) => {
-                    // private posts in orb clubs are encrypted
-                    if (timeline.length < limit && !item.root.isEncrypted) {
-                        this.cache.set(
-                            `lens/publication/${item.id}`,
-                            item.root
-                        );
-                        timeline.push(item.root as AnyPublicationFragment);
+    async getTimeline(address?: string, limit = 10): Promise<LensPost[]> {
+        const addr = address ?? this.accountAddress;
+        const result = await this.graphql(
+            `query Timeline($request: TimelineRequest!) {
+                timeline(request: $request) {
+                    items {
+                        ... on Post {
+                            id isDeleted timestamp
+                            author { address username { localName } }
+                            metadata { ... on TextOnlyMetadata { content } }
+                            commentOn { ... on Post { id } }
+                        }
                     }
-                });
-
-                next = data.pageInfo.next;
-            } while (next && timeline.length < limit);
-
-            return timeline;
-        } catch (error) {
-            elizaLogger.error(error);
-            throw new Error("client-lens:: getTimeline");
-        }
-    }
-
-    private async createPostOnchain(
-        contentURI: string
-    ): Promise<BroadcastResult | undefined> {
-        // gasless + signless if they enabled the lens profile manager
-        if (this.authenticatedProfile?.signless) {
-            const broadcastResult = await this.core.publication.postOnchain({
-                contentURI,
-                openActionModules: [], // TODO: if collectable
-            });
-            return handleBroadcastResult(broadcastResult);
-        }
-
-        // gasless with signed type data
-        const typedDataResult =
-            await this.core.publication.createOnchainPostTypedData({
-                contentURI,
-                openActionModules: [], // TODO: if collectable
-            });
-        const { id, typedData } = typedDataResult.unwrap();
-
-        const signedTypedData = await this.account.signTypedData({
-            domain: omit(typedData.domain as any, "__typename"),
-            types: omit(typedData.types, "__typename"),
-            primaryType: "Post",
-            message: omit(typedData.value, "__typename"),
-        });
-
-        const broadcastResult = await this.core.transaction.broadcastOnchain({
-            id,
-            signature: signedTypedData,
-        });
-        return handleBroadcastResult(broadcastResult);
-    }
-
-    private async createPostMomoka(
-        contentURI: string
-    ): Promise<BroadcastResult | undefined> {
-        elizaLogger.log("createPostMomoka");
-        // gasless + signless if they enabled the lens profile manager
-        if (this.authenticatedProfile?.signless) {
-            const broadcastResult = await this.core.publication.postOnMomoka({
-                contentURI,
-            });
-            return handleBroadcastResult(broadcastResult);
-        }
-
-        // gasless with signed type data
-        const typedDataResult =
-            await this.core.publication.createMomokaPostTypedData({
-                contentURI,
-            });
-        elizaLogger.log("typedDataResult", typedDataResult);
-        const { id, typedData } = typedDataResult.unwrap();
-
-        const signedTypedData = await this.account.signTypedData({
-            domain: omit(typedData.domain as any, "__typename"),
-            types: omit(typedData.types, "__typename"),
-            primaryType: "Post",
-            message: omit(typedData.value, "__typename"),
-        });
-
-        const broadcastResult = await this.core.transaction.broadcastOnMomoka({
-            id,
-            signature: signedTypedData,
-        });
-        return handleBroadcastResult(broadcastResult);
-    }
-
-    private async createCommentOnchain(
-        contentURI: string,
-        commentOn: string
-    ): Promise<BroadcastResult | undefined> {
-        // gasless + signless if they enabled the lens profile manager
-        if (this.authenticatedProfile?.signless) {
-            const broadcastResult = await this.core.publication.commentOnchain({
-                commentOn,
-                contentURI,
-            });
-            return handleBroadcastResult(broadcastResult);
-        }
-
-        // gasless with signed type data
-        const typedDataResult =
-            await this.core.publication.createOnchainCommentTypedData({
-                commentOn,
-                contentURI,
-            });
-
-        const { id, typedData } = typedDataResult.unwrap();
-
-        const signedTypedData = await this.account.signTypedData({
-            domain: omit(typedData.domain as any, "__typename"),
-            types: omit(typedData.types, "__typename"),
-            primaryType: "Comment",
-            message: omit(typedData.value, "__typename"),
-        });
-
-        const broadcastResult = await this.core.transaction.broadcastOnchain({
-            id,
-            signature: signedTypedData,
-        });
-        return handleBroadcastResult(broadcastResult);
-    }
-
-    private async createCommentMomoka(
-        contentURI: string,
-        commentOn: string
-    ): Promise<BroadcastResult | undefined> {
-        // gasless + signless if they enabled the lens profile manager
-        if (this.authenticatedProfile?.signless) {
-            const broadcastResult = await this.core.publication.commentOnMomoka(
-                {
-                    commentOn,
-                    contentURI,
                 }
-            );
-            return handleBroadcastResult(broadcastResult);
-        }
+            }`,
+            {
+                request: {
+                    account: addr,
+                    pageSize: limit > 10 ? "FIFTY" : "TEN",
+                },
+            },
+            true
+        );
 
-        // gasless with signed type data
-        const typedDataResult =
-            await this.core.publication.createMomokaCommentTypedData({
-                commentOn,
-                contentURI,
-            });
+        const items = (
+            result.data as {
+                timeline?: { items?: Array<Record<string, unknown>> };
+            }
+        )?.timeline?.items ?? [];
 
-        const { id, typedData } = typedDataResult.unwrap();
-
-        const signedTypedData = await this.account.signTypedData({
-            domain: omit(typedData.domain as any, "__typename"),
-            types: omit(typedData.types, "__typename"),
-            primaryType: "Comment",
-            message: omit(typedData.value, "__typename"),
-        });
-
-        const broadcastResult = await this.core.transaction.broadcastOnMomoka({
-            id,
-            signature: signedTypedData,
-        });
-        return handleBroadcastResult(broadcastResult);
+        return items.filter((raw) => raw.id).map(rawToLensPost);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function rawToLensPost(raw: Record<string, unknown>): LensPost {
+    return {
+        id: raw.id as string,
+        content: (raw.metadata as { content?: string })?.content ?? "",
+        author: {
+            address: (raw.author as { address: string })?.address ?? "",
+            username: (
+                raw.author as { username?: { localName: string } }
+            )?.username?.localName,
+        },
+        commentOn: raw.commentOn
+            ? { id: (raw.commentOn as { id: string }).id }
+            : null,
+        isDeleted: (raw.isDeleted as boolean) ?? false,
+        timestamp: raw.timestamp as string | undefined,
+    };
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }

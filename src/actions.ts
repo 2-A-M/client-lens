@@ -1,50 +1,65 @@
-import type { LensClient } from "./client";
-import type {
-    Content,
-    IAgentRuntime,
-    Memory,
-    UUID,
-} from "@elizaos/core";
-import { textOnly } from "@lens-protocol/metadata";
-import { createPublicationMemory } from "./memory";
-import type { AnyPublicationFragment } from "@lens-protocol/client";
-import type StorjProvider from "./providers/StorjProvider";
+/**
+ * Publication creation for Lens V3.
+ *
+ * Posts use data: URIs with JSON metadata — no IPFS pinning needed for text.
+ */
 
-export async function sendPublication({
-    client,
-    runtime,
-    content,
-    roomId,
-    commentOn,
-    ipfs,
-}: {
+import type { LensClient } from "./client";
+import type { Content, IAgentRuntime, Memory } from "@elizaos/core";
+import { stringToUuid } from "@elizaos/core";
+import type { LensPost } from "./types";
+
+export async function sendPublication(opts: {
     client: LensClient;
     runtime: IAgentRuntime;
-    content: Content;
-    roomId: UUID;
+    content: string;
+    roomId: string;
     commentOn?: string;
-    ipfs: StorjProvider;
-}): Promise<{ memory?: Memory; publication?: AnyPublicationFragment }> {
-    // TODO: arweave provider for content hosting
-    const metadata = textOnly({ content: content.text });
-    const contentURI = await ipfs.pinJson(metadata);
+    dryRun?: boolean;
+}): Promise<{ post: LensPost | null; memory: Memory | null }> {
+    const { client, runtime, content, roomId, commentOn, dryRun } = opts;
 
-    const publication = await client.createPublication(
-        contentURI,
-        false, // TODO: support collectable settings
+    if (dryRun) {
+        runtime.logger.info(
+            `[lens] DRY RUN: Would post: ${content.substring(0, 100)}...`
+        );
+        return { post: null, memory: null };
+    }
+
+    const { hash, error } = await client.createPublication(
+        content,
         commentOn
     );
 
-    if (publication) {
-        return {
-            publication,
-            memory: createPublicationMemory({
-                roomId,
-                runtime,
-                publication: publication as AnyPublicationFragment,
-            }),
-        };
+    if (!hash) {
+        runtime.logger.error(`[lens] Failed to post: ${error}`);
+        return { post: null, memory: null };
     }
 
-    return {};
+    runtime.logger.info(`[lens] Posted: ${hash}`);
+
+    // Wait for indexing and get the full post
+    const post = await client.waitForIndexing(hash);
+
+    if (!post) {
+        runtime.logger.warn(`[lens] Post created (${hash}) but not yet indexed`);
+    }
+
+    // Create memory for the post
+    const memory: Memory = {
+        id: stringToUuid(`lens-${hash}-${runtime.agentId}`),
+        entityId: runtime.agentId,
+        agentId: runtime.agentId,
+        roomId: stringToUuid(roomId),
+        content: {
+            text: content,
+            source: "lens",
+            url: post?.id ? `https://hey.xyz/posts/${post.id}` : undefined,
+        } as Content,
+        createdAt: Date.now(),
+    };
+
+    await runtime.createMemory(memory, "messages");
+
+    return { post, memory };
 }

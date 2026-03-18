@@ -1,141 +1,151 @@
+/**
+ * Lens V3 autonomous post generation — periodically creates new posts.
+ */
+
 import {
-    composeContext,
-    generateText,
+    composePrompt,
     type IAgentRuntime,
-    ModelClass,
+    ModelType,
     stringToUuid,
-    elizaLogger,
 } from "@elizaos/core";
 import type { LensClient } from "./client";
 import { formatTimeline, postTemplate } from "./prompts";
-import { publicationUuid } from "./utils";
-import { createPublicationMemory } from "./memory";
 import { sendPublication } from "./actions";
-import type StorjProvider from "./providers/StorjProvider";
 
 export class LensPostManager {
-    private timeout: NodeJS.Timeout | undefined;
+    private client: LensClient;
+    private runtime: IAgentRuntime;
+    private accountAddress: string;
+    private dryRun: boolean;
+    private postTimer: ReturnType<typeof setTimeout> | null = null;
 
     constructor(
-        public client: LensClient,
-        public runtime: IAgentRuntime,
-        private profileId: string,
-        public cache: Map<string, any>,
-        private ipfs: StorjProvider
-    ) {}
-
-    public async start() {
-        const generateNewPubLoop = async () => {
-            try {
-                await this.generateNewPublication();
-            } catch (error) {
-                elizaLogger.error(error);
-                return;
-            }
-
-            this.timeout = setTimeout(
-                generateNewPubLoop,
-                (Math.floor(Math.random() * (4 - 1 + 1)) + 1) * 60 * 60 * 1000
-            ); // Random interval between 1 and 4 hours
-        };
-
-        generateNewPubLoop();
+        client: LensClient,
+        runtime: IAgentRuntime,
+        accountAddress: string
+    ) {
+        this.client = client;
+        this.runtime = runtime;
+        this.accountAddress = accountAddress;
+        this.dryRun = runtime.getSetting("LENS_DRY_RUN") === "true";
     }
 
-    public async stop() {
-        if (this.timeout) clearTimeout(this.timeout);
+    async start(): Promise<void> {
+        await this.generateNewPublication();
+        this.scheduleNext();
     }
 
-    private async generateNewPublication() {
-        elizaLogger.info("Generating new publication");
+    async stop(): Promise<void> {
+        if (this.postTimer) {
+            clearTimeout(this.postTimer);
+            this.postTimer = null;
+        }
+    }
+
+    private scheduleNext(): void {
+        // Random interval between 1–4 hours
+        const minMs = 60 * 60 * 1000;
+        const maxMs = 4 * 60 * 60 * 1000;
+        const delay = Math.floor(Math.random() * (maxMs - minMs)) + minMs;
+
+        this.runtime.logger.info(
+            `[lens] Next post in ${Math.round(delay / 60000)} minutes`
+        );
+
+        this.postTimer = setTimeout(async () => {
+            await this.generateNewPublication();
+            this.scheduleNext();
+        }, delay);
+    }
+
+    private async generateNewPublication(): Promise<void> {
         try {
-            const profile = await this.client.getProfile(this.profileId);
-            await this.runtime.ensureUserExists(
-                this.runtime.agentId,
-                profile.handle!,
-                this.runtime.character.name,
-                "lens"
-            );
+            const runtime = this.runtime;
 
-            const timeline = await this.client.getTimeline(this.profileId);
-
-            // this.cache.set("lens/timeline", timeline);
-
-            const formattedHomeTimeline = formatTimeline(
-                this.runtime.character,
+            // Get profile and timeline for context
+            const profile = await this.client.getProfile();
+            const timeline = await this.client.getTimeline();
+            const formattedTimeline = formatTimeline(
+                runtime.character,
                 timeline
             );
 
-            const generateRoomId = stringToUuid("lens_generate_room");
+            // Get recent posts to avoid repetition
+            const recentPosts = await this.client.getPublicationsFor(
+                this.accountAddress,
+                10
+            );
+            const recentPostsText = recentPosts
+                .map((p) => p.content)
+                .join("\n");
 
-            const state = await this.runtime.composeState(
+            const roomId = stringToUuid(`lens-post-${this.accountAddress}`);
+
+            // Pick random topic and adjective from character
+            const topics = runtime.character.topics ?? [];
+            const topic =
+                topics[Math.floor(Math.random() * topics.length)] ??
+                "something interesting";
+            const adjectives = runtime.character.adjectives ?? [];
+            const adjective =
+                adjectives[
+                    Math.floor(Math.random() * adjectives.length)
+                ] ?? "thought-provoking";
+
+            const state = await runtime.composeState(
                 {
-                    roomId: generateRoomId,
-                    userId: this.runtime.agentId,
-                    agentId: this.runtime.agentId,
-                    content: { text: "", action: "" },
-                },
+                    entityId: runtime.agentId,
+                    agentId: runtime.agentId,
+                    roomId,
+                    content: { text: "", source: "lens" },
+                } as unknown as import("@elizaos/core").Memory,
                 {
-                    lensHandle: profile.handle,
-                    timeline: formattedHomeTimeline,
+                    lensHandle:
+                        profile?.username ?? this.accountAddress,
+                    timeline: formattedTimeline,
+                    recentPosts: recentPostsText,
+                    topic,
+                    adjective,
                 }
             );
 
-            const context = composeContext({
+            const context = composePrompt({
                 state,
-                template:
-                    this.runtime.character.templates?.lensPostTemplate ||
-                    postTemplate,
+                template: postTemplate,
             });
 
-            const content = await generateText({
-                runtime: this.runtime,
-                context,
-                modelClass: ModelClass.SMALL,
+            const result = await runtime.useModel(ModelType.TEXT_SMALL, {
+                prompt: context,
             });
+            const text = typeof result === "string"
+                ? result
+                : (result as { text?: string })?.text ?? "";
 
-            if (this.runtime.getSetting("LENS_DRY_RUN") === "true") {
-                elizaLogger.info(`Dry run: would have posted: ${content}`);
+            if (!text?.trim()) {
+                runtime.logger.debug("[lens] No post text generated");
                 return;
             }
 
-            try {
-                const { publication } = await sendPublication({
-                    client: this.client,
-                    runtime: this.runtime,
-                    roomId: generateRoomId,
-                    content: { text: content },
-                    ipfs: this.ipfs,
-                });
+            // Clean up the generated text
+            const cleanText = text
+                .replace(/^["']|["']$/g, "")
+                .trim();
 
-                if (!publication) throw new Error("failed to send publication");
+            await sendPublication({
+                client: this.client,
+                runtime,
+                content: cleanText,
+                roomId: roomId as string,
+                dryRun: this.dryRun,
+            });
 
-                const roomId = publicationUuid({
-                    agentId: this.runtime.agentId,
-                    pubId: publication.id,
-                });
-
-                await this.runtime.ensureRoomExists(roomId);
-
-                await this.runtime.ensureParticipantInRoom(
-                    this.runtime.agentId,
-                    roomId
-                );
-
-                elizaLogger.info(`[Lens Client] Published ${publication.id}`);
-
-                await this.runtime.messageManager.createMemory(
-                    createPublicationMemory({
-                        roomId,
-                        runtime: this.runtime,
-                        publication,
-                    })
-                );
-            } catch (error) {
-                elizaLogger.error("Error sending publication:", error);
-            }
-        } catch (error) {
-            elizaLogger.error("Error generating new publication:", error);
+            runtime.logger.info(
+                `[lens] Generated post: ${cleanText.substring(0, 80)}...`
+            );
+        } catch (err) {
+            this.runtime.logger.error(
+                `[lens] Error generating post: ${err}`
+            );
         }
     }
 }

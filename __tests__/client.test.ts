@@ -1,124 +1,178 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { LensClient } from '../src/client';
-import { LensClient as LensClientCore, LimitType, PublicationType } from '@lens-protocol/client';
+import { describe, expect, it, vi, beforeEach } from "vitest";
 
-// Mock dependencies
-vi.mock('@lens-protocol/client', async () => {
-    const actual = await vi.importActual('@lens-protocol/client');
-    return {
-        ...actual,
-        LensClient: vi.fn().mockImplementation(() => ({
-            authentication: {
-                generateChallenge: vi.fn().mockResolvedValue({ id: 'challenge-id', text: 'challenge-text' }),
-                authenticate: vi.fn().mockResolvedValue({ accessToken: 'mock-token', refreshToken: 'mock-refresh' })
-            },
-            profile: {
-                fetch: vi.fn().mockResolvedValue({
-                    id: '0x01',
-                    handle: { localName: 'test.lens' },
-                    metadata: {
-                        displayName: 'Test User',
-                        bio: 'Test bio',
-                        picture: {
-                            uri: 'https://example.com/pic-raw.jpg'
-                        }
-                    }
-                })
-            },
-            publication: {
-                fetchAll: vi.fn().mockResolvedValue({
-                    items: [
-                        {
-                            id: 'pub-1',
-                            metadata: { content: 'Test post' },
-                            stats: { reactions: 10 }
-                        }
-                    ]
-                })
-            }
-        }))
-    };
-});
+// Mock fetch globally
+const mockFetch = vi.fn();
+global.fetch = mockFetch as unknown as typeof fetch;
 
-describe('LensClient', () => {
-    let client: LensClient;
-    const mockRuntime = {
-        name: 'test-runtime',
-        memory: new Map(),
-        getMemory: vi.fn(),
-        setMemory: vi.fn(),
-        clearMemory: vi.fn()
-    };
-    const mockAccount = {
-        address: '0x123' as `0x${string}`,
-        privateKey: '0xabc' as `0x${string}`,
-        signMessage: vi.fn().mockResolvedValue('signed-message'),
-        signTypedData: vi.fn()
-    };
-
+describe("LensClient", () => {
     beforeEach(() => {
         vi.clearAllMocks();
-        client = new LensClient({
-            runtime: mockRuntime,
-            cache: new Map(),
-            account: mockAccount,
-            profileId: '0x01' as `0x${string}`
-        });
     });
 
-    describe('authenticate', () => {
-        it('should authenticate successfully', async () => {
-            await client.authenticate();
-            expect(client['authenticated']).toBe(true);
-            expect(client['core'].authentication.generateChallenge).toHaveBeenCalledWith({
-                signedBy: mockAccount.address,
-                for: '0x01'
+    describe("GraphQL transport", () => {
+        it("sends correct headers with API key", async () => {
+            mockFetch.mockResolvedValueOnce({
+                ok: true,
+                json: async () => ({ data: { account: null } }),
             });
-            expect(mockAccount.signMessage).toHaveBeenCalledWith({ message: 'challenge-text' });
-        });
 
-        it('should handle authentication errors', async () => {
-            const mockError = new Error('Auth failed');
-            vi.mocked(client['core'].authentication.generateChallenge).mockRejectedValueOnce(mockError);
-            
-            await expect(client.authenticate()).rejects.toThrow('Auth failed');
-            expect(client['authenticated']).toBe(false);
-        });
-    });
+            const { LensClient } = await import("../src/client");
+            const mockRuntime = {
+                logger: { info: vi.fn(), error: vi.fn(), debug: vi.fn(), warn: vi.fn() },
+                getSetting: vi.fn(),
+                agentId: "test-agent",
+            };
 
-    describe('getPublicationsFor', () => {
-        it('should fetch publications successfully', async () => {
-            const publications = await client.getPublicationsFor('0x123');
-            expect(publications).toHaveLength(1);
-            expect(publications[0].id).toBe('pub-1');
-            expect(client['core'].publication.fetchAll).toHaveBeenCalledWith({
-                limit: LimitType.Fifty,
-                where: {
-                    from: ['0x123'],
-                    publicationTypes: [PublicationType.Post]
-                }
+            const client = new LensClient(mockRuntime as any, new Map(), {
+                apiKey: "test-api-key",
+                appAddress: "0xapp",
+                accountAddress: "0xaccount",
+                privateKey: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
             });
-        });
 
-        it('should handle fetch errors', async () => {
-            vi.mocked(client['core'].publication.fetchAll).mockRejectedValueOnce(new Error('Fetch failed'));
-            await expect(client.getPublicationsFor('0x123')).rejects.toThrow('Fetch failed');
+            await client.getProfile("0xtest");
+
+            expect(mockFetch).toHaveBeenCalled();
+            const [url, opts] = mockFetch.mock.calls[0];
+            expect(url).toBe("https://api.lens.xyz/graphql");
+            expect(opts.headers["x-api-key"]).toBe("test-api-key");
+            expect(opts.headers["Content-Type"]).toBe("application/json");
         });
     });
 
-    describe('getProfile', () => {
-        it('should fetch profile successfully', async () => {
-            const profile = await client.getProfile('0x123');
-            expect(profile).toBeDefined();
-            expect(profile.id).toBe('0x01');
-            expect(profile.handle).toBe('test.lens');
-            expect(profile.pfp).toBe('https://example.com/pic-raw.jpg');
-            expect(client['core'].profile.fetch).toHaveBeenCalledWith({ forProfileId: '0x123' });
+    describe("createPublication", () => {
+        it("rejects content over 5000 chars", async () => {
+            const { LensClient } = await import("../src/client");
+            const mockRuntime = {
+                logger: { info: vi.fn(), error: vi.fn(), debug: vi.fn(), warn: vi.fn() },
+            };
+
+            const client = new LensClient(mockRuntime as any, new Map(), {
+                apiKey: "key",
+                appAddress: "0xapp",
+                accountAddress: "0xaccount",
+                privateKey: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            });
+
+            const result = await client.createPublication("A".repeat(5001));
+            expect(result.hash).toBeNull();
+            expect(result.error).toContain("5000");
         });
 
-        it('should handle profile fetch errors', async () => {
-            vi.mocked(client['core'].profile.fetch).mockRejectedValueOnce(new Error('Profile fetch failed'));
-            await expect(client.getProfile('0x123')).rejects.toThrow('Profile fetch failed');
+        it("sends correct mutation for text post", async () => {
+            mockFetch.mockResolvedValueOnce({
+                ok: true,
+                json: async () => ({
+                    data: { post: { hash: "0xabc123" } },
+                }),
+            });
+
+            const { LensClient } = await import("../src/client");
+            const mockRuntime = {
+                logger: { info: vi.fn(), error: vi.fn(), debug: vi.fn(), warn: vi.fn() },
+            };
+
+            const client = new LensClient(mockRuntime as any, new Map(), {
+                apiKey: "key",
+                appAddress: "0xapp",
+                accountAddress: "0xaccount",
+                privateKey: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            });
+            // Set authenticated state
+            (client as any).accessToken = "test-token";
+            client.authenticated = true;
+
+            const result = await client.createPublication("Hello Lens V3!");
+            expect(result.hash).toBe("0xabc123");
+        });
+    });
+
+    describe("getProfile", () => {
+        it("returns profile from API response", async () => {
+            mockFetch.mockResolvedValueOnce({
+                ok: true,
+                json: async () => ({
+                    data: {
+                        account: {
+                            address: "0xtest",
+                            username: { localName: "testuser" },
+                            metadata: { name: "Test", bio: "Bio", picture: null },
+                        },
+                    },
+                }),
+            });
+
+            const { LensClient } = await import("../src/client");
+            const mockRuntime = {
+                logger: { info: vi.fn(), error: vi.fn(), debug: vi.fn(), warn: vi.fn() },
+            };
+
+            const client = new LensClient(mockRuntime as any, new Map(), {
+                apiKey: "key",
+                appAddress: "0xapp",
+                accountAddress: "0xaccount",
+                privateKey: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            });
+
+            const profile = await client.getProfile("0xtest");
+            expect(profile).not.toBeNull();
+            expect(profile?.username).toBe("testuser");
+            expect(profile?.address).toBe("0xtest");
+        });
+
+        it("returns null for non-existent profile", async () => {
+            mockFetch.mockResolvedValueOnce({
+                ok: true,
+                json: async () => ({ data: { account: null } }),
+            });
+
+            const { LensClient } = await import("../src/client");
+            const mockRuntime = {
+                logger: { info: vi.fn(), error: vi.fn(), debug: vi.fn(), warn: vi.fn() },
+            };
+
+            const client = new LensClient(mockRuntime as any, new Map(), {
+                apiKey: "key",
+                appAddress: "0xapp",
+                accountAddress: "0xaccount",
+                privateKey: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            });
+
+            const profile = await client.getProfile("0xnonexistent");
+            expect(profile).toBeNull();
+        });
+
+        it("caches profile results", async () => {
+            mockFetch.mockResolvedValueOnce({
+                ok: true,
+                json: async () => ({
+                    data: {
+                        account: {
+                            address: "0xcached",
+                            username: { localName: "cached" },
+                            metadata: {},
+                        },
+                    },
+                }),
+            });
+
+            const { LensClient } = await import("../src/client");
+            const mockRuntime = {
+                logger: { info: vi.fn(), error: vi.fn(), debug: vi.fn(), warn: vi.fn() },
+            };
+
+            const client = new LensClient(mockRuntime as any, new Map(), {
+                apiKey: "key",
+                appAddress: "0xapp",
+                accountAddress: "0xaccount",
+                privateKey: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            });
+
+            await client.getProfile("0xcached");
+            await client.getProfile("0xcached");
+
+            // Only one fetch call — second was served from cache
+            expect(mockFetch).toHaveBeenCalledTimes(1);
         });
     });
 });

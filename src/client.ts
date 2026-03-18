@@ -20,6 +20,7 @@ export class LensClient {
     private appAddress: string;
     private accountAddress: string;
     private wallet: ethers.Wallet;
+    private origin: string;
     private accessToken: string | null = null;
     private refreshToken: string | null = null;
     private cache: Map<string, unknown>;
@@ -34,6 +35,7 @@ export class LensClient {
             appAddress: string;
             accountAddress: string;
             privateKey: string;
+            origin?: string;
         }
     ) {
         this.runtime = runtime;
@@ -42,6 +44,7 @@ export class LensClient {
         this.appAddress = opts.appAddress;
         this.accountAddress = opts.accountAddress;
         this.wallet = new ethers.Wallet(opts.privateKey);
+        this.origin = opts.origin ?? "https://lens.xyz";
     }
 
     // -----------------------------------------------------------------------
@@ -57,7 +60,7 @@ export class LensClient {
 
         const headers: Record<string, string> = {
             "Content-Type": "application/json",
-            Origin: "https://milady.ai",
+            Origin: this.origin,
         };
         if (this.apiKey) headers["x-api-key"] = this.apiKey;
         if (authenticated && this.accessToken) {
@@ -155,6 +158,65 @@ export class LensClient {
         }
     }
 
+    /** Refresh the access token using the stored refresh token. Falls back to full re-auth. */
+    async refreshAuth(): Promise<boolean> {
+        if (!this.refreshToken) return this.authenticate();
+
+        try {
+            const result = await this.graphql(
+                `mutation Refresh($request: RefreshRequest!) {
+                    refresh(request: $request) {
+                        ... on AuthenticationTokens { accessToken refreshToken }
+                        ... on ForbiddenError { reason }
+                    }
+                }`,
+                { request: { refreshToken: this.refreshToken } }
+            );
+
+            const refresh = (
+                result.data as {
+                    refresh?: {
+                        accessToken?: string;
+                        refreshToken?: string;
+                        reason?: string;
+                    };
+                }
+            )?.refresh;
+
+            if (refresh?.accessToken) {
+                this.accessToken = refresh.accessToken;
+                this.refreshToken = refresh.refreshToken ?? this.refreshToken;
+                this.runtime.logger.debug("[lens] Token refreshed");
+                return true;
+            }
+
+            // Refresh failed — fall back to full re-authentication
+            this.runtime.logger.warn("[lens] Token refresh failed, re-authenticating");
+            return this.authenticate();
+        } catch {
+            return this.authenticate();
+        }
+    }
+
+    /** Execute an authenticated GraphQL call, auto-refreshing on auth errors. */
+    private async authenticatedGraphql(
+        query: string,
+        variables: Record<string, unknown> = {}
+    ): Promise<GraphQLResponse> {
+        const result = await this.graphql(query, variables, true);
+
+        // If we get an auth error, refresh and retry once
+        const firstError = result.errors?.[0]?.message ?? "";
+        if (firstError.includes("Unauthenticated") || firstError.includes("expired")) {
+            const refreshed = await this.refreshAuth();
+            if (refreshed) {
+                return this.graphql(query, variables, true);
+            }
+        }
+
+        return result;
+    }
+
     // -----------------------------------------------------------------------
     // Publications
     // -----------------------------------------------------------------------
@@ -188,7 +250,7 @@ export class LensClient {
         const request: Record<string, unknown> = { contentUri };
         if (commentOn) request.commentOn = commentOn;
 
-        const result = await this.graphql(
+        const result = await this.authenticatedGraphql(
             `mutation Post($request: CreatePostRequest!) {
                 post(request: $request) {
                     ... on PostResponse { hash }
@@ -197,8 +259,7 @@ export class LensClient {
                     ... on TransactionWillFail { reason }
                 }
             }`,
-            { request },
-            true
+            { request }
         );
 
         if (result.errors) {
@@ -256,6 +317,7 @@ export class LensClient {
             const statusResult = await this.graphql(
                 `query TransactionStatus($request: TransactionStatusRequest!) {
                     transactionStatus(request: $request) {
+                        __typename
                         ... on FinishedTransactionStatus { blockTimestamp }
                         ... on FailedTransactionStatus { reason }
                         ... on NotIndexedYetStatus { reason }
@@ -266,14 +328,15 @@ export class LensClient {
             const status = (
                 statusResult.data as {
                     transactionStatus?: {
+                        __typename?: string;
                         blockTimestamp?: string;
                         reason?: string;
                     };
                 }
             )?.transactionStatus;
 
-            if (status?.blockTimestamp && !status.reason) break;
-            if (status?.reason === "FAILED") return null;
+            if (status?.__typename === "FinishedTransactionStatus") break;
+            if (status?.__typename === "FailedTransactionStatus") return null;
         }
 
         return this.getPublication(txHash);
@@ -323,7 +386,7 @@ export class LensClient {
             post: LensPost;
         }>
     > {
-        const result = await this.graphql(
+        const result = await this.authenticatedGraphql(
             `query Notifications($request: NotificationRequest!) {
                 notifications(request: $request) {
                     items {
@@ -352,8 +415,7 @@ export class LensClient {
                     }
                 }
             }`,
-            { request: { orderBy: "DEFAULT" } },
-            true
+            { request: { orderBy: "DEFAULT" } }
         );
 
         const items = (
@@ -431,7 +493,7 @@ export class LensClient {
 
     async getTimeline(address?: string, limit = 10): Promise<LensPost[]> {
         const addr = address ?? this.accountAddress;
-        const result = await this.graphql(
+        const result = await this.authenticatedGraphql(
             `query Timeline($request: TimelineRequest!) {
                 timeline(request: $request) {
                     items {
@@ -449,8 +511,7 @@ export class LensClient {
                     account: addr,
                     pageSize: limit > 10 ? "FIFTY" : "TEN",
                 },
-            },
-            true
+            }
         );
 
         const items = (

@@ -31,11 +31,14 @@ export class LensAgentClient {
 
         const cache = new Map<string, unknown>();
 
+        const origin = runtime.getSetting("LENS_ORIGIN");
+
         this.client = new LensClient(runtime, cache, {
             apiKey: apiKey as string,
             appAddress: appAddress as string,
             accountAddress: accountAddress as string,
             privateKey: privateKey as string,
+            origin: typeof origin === "string" ? origin : undefined,
         });
 
         this.posts = new LensPostManager(
@@ -56,10 +59,9 @@ export class LensAgentClient {
         // Authenticate with Lens V3
         const ok = await this.client.authenticate();
         if (!ok) {
-            runtime.logger.error(
-                "[lens] Authentication failed — client will not start"
+            throw new Error(
+                "[lens] Authentication failed — check LENS_API_KEY, LENS_ACCOUNT_ADDRESS, LENS_PRIVATE_KEY, and LENS_APP_ADDRESS"
             );
-            return;
         }
 
         // Load profile info

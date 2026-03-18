@@ -10,6 +10,7 @@ var LensClient = class {
   appAddress;
   accountAddress;
   wallet;
+  origin;
   accessToken = null;
   refreshToken = null;
   cache;
@@ -22,6 +23,7 @@ var LensClient = class {
     this.appAddress = opts.appAddress;
     this.accountAddress = opts.accountAddress;
     this.wallet = new ethers.Wallet(opts.privateKey);
+    this.origin = opts.origin ?? "https://lens.xyz";
   }
   // -----------------------------------------------------------------------
   // GraphQL transport
@@ -30,7 +32,7 @@ var LensClient = class {
     await sleep(RATE_LIMIT_DELAY_MS);
     const headers = {
       "Content-Type": "application/json",
-      Origin: "https://milady.ai"
+      Origin: this.origin
     };
     if (this.apiKey) headers["x-api-key"] = this.apiKey;
     if (authenticated && this.accessToken) {
@@ -104,6 +106,46 @@ var LensClient = class {
       return false;
     }
   }
+  /** Refresh the access token using the stored refresh token. Falls back to full re-auth. */
+  async refreshAuth() {
+    var _a;
+    if (!this.refreshToken) return this.authenticate();
+    try {
+      const result = await this.graphql(
+        `mutation Refresh($request: RefreshRequest!) {
+                    refresh(request: $request) {
+                        ... on AuthenticationTokens { accessToken refreshToken }
+                        ... on ForbiddenError { reason }
+                    }
+                }`,
+        { request: { refreshToken: this.refreshToken } }
+      );
+      const refresh = (_a = result.data) == null ? void 0 : _a.refresh;
+      if (refresh == null ? void 0 : refresh.accessToken) {
+        this.accessToken = refresh.accessToken;
+        this.refreshToken = refresh.refreshToken ?? this.refreshToken;
+        this.runtime.logger.debug("[lens] Token refreshed");
+        return true;
+      }
+      this.runtime.logger.warn("[lens] Token refresh failed, re-authenticating");
+      return this.authenticate();
+    } catch {
+      return this.authenticate();
+    }
+  }
+  /** Execute an authenticated GraphQL call, auto-refreshing on auth errors. */
+  async authenticatedGraphql(query, variables = {}) {
+    var _a, _b;
+    const result = await this.graphql(query, variables, true);
+    const firstError = ((_b = (_a = result.errors) == null ? void 0 : _a[0]) == null ? void 0 : _b.message) ?? "";
+    if (firstError.includes("Unauthenticated") || firstError.includes("expired")) {
+      const refreshed = await this.refreshAuth();
+      if (refreshed) {
+        return this.graphql(query, variables, true);
+      }
+    }
+    return result;
+  }
   // -----------------------------------------------------------------------
   // Publications
   // -----------------------------------------------------------------------
@@ -129,7 +171,7 @@ var LensClient = class {
     )}`;
     const request = { contentUri };
     if (commentOn) request.commentOn = commentOn;
-    const result = await this.graphql(
+    const result = await this.authenticatedGraphql(
       `mutation Post($request: CreatePostRequest!) {
                 post(request: $request) {
                     ... on PostResponse { hash }
@@ -138,8 +180,7 @@ var LensClient = class {
                     ... on TransactionWillFail { reason }
                 }
             }`,
-      { request },
-      true
+      { request }
     );
     if (result.errors) {
       return { hash: null, error: (_a = result.errors[0]) == null ? void 0 : _a.message };
@@ -183,6 +224,7 @@ var LensClient = class {
       const statusResult = await this.graphql(
         `query TransactionStatus($request: TransactionStatusRequest!) {
                     transactionStatus(request: $request) {
+                        __typename
                         ... on FinishedTransactionStatus { blockTimestamp }
                         ... on FailedTransactionStatus { reason }
                         ... on NotIndexedYetStatus { reason }
@@ -191,8 +233,8 @@ var LensClient = class {
         { request: { txHash } }
       );
       const status = (_a = statusResult.data) == null ? void 0 : _a.transactionStatus;
-      if ((status == null ? void 0 : status.blockTimestamp) && !status.reason) break;
-      if ((status == null ? void 0 : status.reason) === "FAILED") return null;
+      if ((status == null ? void 0 : status.__typename) === "FinishedTransactionStatus") break;
+      if ((status == null ? void 0 : status.__typename) === "FailedTransactionStatus") return null;
     }
     return this.getPublication(txHash);
   }
@@ -226,7 +268,7 @@ var LensClient = class {
   // -----------------------------------------------------------------------
   async getMentions() {
     var _a, _b;
-    const result = await this.graphql(
+    const result = await this.authenticatedGraphql(
       `query Notifications($request: NotificationRequest!) {
                 notifications(request: $request) {
                     items {
@@ -255,8 +297,7 @@ var LensClient = class {
                     }
                 }
             }`,
-      { request: { orderBy: "DEFAULT" } },
-      true
+      { request: { orderBy: "DEFAULT" } }
     );
     const items = ((_b = (_a = result.data) == null ? void 0 : _a.notifications) == null ? void 0 : _b.items) ?? [];
     return items.map((item) => {
@@ -301,7 +342,7 @@ var LensClient = class {
   async getTimeline(address, limit = 10) {
     var _a, _b;
     const addr = address ?? this.accountAddress;
-    const result = await this.graphql(
+    const result = await this.authenticatedGraphql(
       `query Timeline($request: TimelineRequest!) {
                 timeline(request: $request) {
                     items {
@@ -319,8 +360,7 @@ var LensClient = class {
           account: addr,
           pageSize: limit > 10 ? "FIFTY" : "TEN"
         }
-      },
-      true
+      }
     );
     const items = ((_b = (_a = result.data) == null ? void 0 : _a.timeline) == null ? void 0 : _b.items) ?? [];
     return items.filter((raw) => raw.id).map(rawToLensPost);
@@ -641,14 +681,15 @@ var LensInteractionManager = class {
   accountAddress;
   pollInterval;
   dryRun;
-  lastCheckedNotificationId = null;
+  seenNotificationIds = /* @__PURE__ */ new Set();
   pollTimer = null;
   constructor(client, runtime, accountAddress) {
     this.client = client;
     this.runtime = runtime;
     this.accountAddress = accountAddress;
     const interval = runtime.getSetting("LENS_POLL_INTERVAL");
-    this.pollInterval = (typeof interval === "string" ? parseInt(interval, 10) : 120) * 1e3;
+    const parsed = typeof interval === "string" ? parseInt(interval, 10) : NaN;
+    this.pollInterval = (Number.isFinite(parsed) && parsed > 0 ? parsed : 120) * 1e3;
     this.dryRun = runtime.getSetting("LENS_DRY_RUN") === "true";
   }
   async start() {
@@ -665,13 +706,11 @@ var LensInteractionManager = class {
     }
   }
   async handleInteractions() {
-    var _a;
     try {
       const mentions = await this.client.getMentions();
       for (const mention of mentions) {
-        if (this.lastCheckedNotificationId && mention.id <= this.lastCheckedNotificationId) {
-          continue;
-        }
+        if (this.seenNotificationIds.has(mention.id)) continue;
+        this.seenNotificationIds.add(mention.id);
         const post = mention.post;
         if (post.author.address.toLowerCase() === this.accountAddress.toLowerCase()) {
           continue;
@@ -686,8 +725,9 @@ var LensInteractionManager = class {
         if (exists) continue;
         await this.handleMention(post);
       }
-      if (mentions.length > 0) {
-        this.lastCheckedNotificationId = ((_a = mentions[0]) == null ? void 0 : _a.id) ?? this.lastCheckedNotificationId;
+      if (this.seenNotificationIds.size > 1e3) {
+        const ids = Array.from(this.seenNotificationIds);
+        this.seenNotificationIds = new Set(ids.slice(-500));
       }
     } catch (err) {
       this.runtime.logger.error(
@@ -785,11 +825,13 @@ var LensAgentClient = class _LensAgentClient {
       );
     }
     const cache = /* @__PURE__ */ new Map();
+    const origin = runtime.getSetting("LENS_ORIGIN");
     this.client = new LensClient(runtime, cache, {
       apiKey,
       appAddress,
       accountAddress,
-      privateKey
+      privateKey,
+      origin: typeof origin === "string" ? origin : void 0
     });
     this.posts = new LensPostManager(
       this.client,
@@ -806,10 +848,9 @@ var LensAgentClient = class _LensAgentClient {
     const runtime = this.runtime;
     const ok = await this.client.authenticate();
     if (!ok) {
-      runtime.logger.error(
-        "[lens] Authentication failed \u2014 client will not start"
+      throw new Error(
+        "[lens] Authentication failed \u2014 check LENS_API_KEY, LENS_ACCOUNT_ADDRESS, LENS_PRIVATE_KEY, and LENS_APP_ADDRESS"
       );
-      return;
     }
     const profile = await this.client.getProfile();
     if (profile) {
@@ -836,4 +877,4 @@ var LensAgentClient = class _LensAgentClient {
 export {
   LensAgentClient
 };
-//# sourceMappingURL=lens-client-LRMD2UEK.js.map
+//# sourceMappingURL=lens-client-C2MTSBTA.js.map

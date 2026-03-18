@@ -26,7 +26,7 @@ export class LensInteractionManager {
     private accountAddress: string;
     private pollInterval: number;
     private dryRun: boolean;
-    private lastCheckedNotificationId: string | null = null;
+    private seenNotificationIds = new Set<string>();
     private pollTimer: ReturnType<typeof setInterval> | null = null;
 
     constructor(
@@ -39,9 +39,8 @@ export class LensInteractionManager {
         this.accountAddress = accountAddress;
 
         const interval = runtime.getSetting("LENS_POLL_INTERVAL");
-        this.pollInterval =
-            (typeof interval === "string" ? parseInt(interval, 10) : 120) *
-            1000;
+        const parsed = typeof interval === "string" ? parseInt(interval, 10) : NaN;
+        this.pollInterval = (Number.isFinite(parsed) && parsed > 0 ? parsed : 120) * 1000;
 
         this.dryRun = runtime.getSetting("LENS_DRY_RUN") === "true";
     }
@@ -67,12 +66,8 @@ export class LensInteractionManager {
 
             for (const mention of mentions) {
                 // Skip already-processed notifications
-                if (
-                    this.lastCheckedNotificationId &&
-                    mention.id <= this.lastCheckedNotificationId
-                ) {
-                    continue;
-                }
+                if (this.seenNotificationIds.has(mention.id)) continue;
+                this.seenNotificationIds.add(mention.id);
 
                 const post = mention.post;
 
@@ -98,9 +93,10 @@ export class LensInteractionManager {
                 await this.handleMention(post);
             }
 
-            if (mentions.length > 0) {
-                this.lastCheckedNotificationId =
-                    mentions[0]?.id ?? this.lastCheckedNotificationId;
+            // Prevent unbounded Set growth — keep only recent IDs
+            if (this.seenNotificationIds.size > 1000) {
+                const ids = Array.from(this.seenNotificationIds);
+                this.seenNotificationIds = new Set(ids.slice(-500));
             }
         } catch (err) {
             this.runtime.logger.error(

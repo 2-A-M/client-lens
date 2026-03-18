@@ -5,7 +5,7 @@ var lensPlugin = {
   clients: [
     {
       async start(runtime) {
-        const { LensAgentClient } = await import("./lens-client-C2MTSBTA.js");
+        const { LensAgentClient } = await import("./lens-client-H5GXSDIO.js");
         return LensAgentClient.start(
           runtime
         );

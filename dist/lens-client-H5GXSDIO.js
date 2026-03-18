@@ -137,8 +137,8 @@ var LensClient = class {
   async authenticatedGraphql(query, variables = {}) {
     var _a, _b;
     const result = await this.graphql(query, variables, true);
-    const firstError = ((_b = (_a = result.errors) == null ? void 0 : _a[0]) == null ? void 0 : _b.message) ?? "";
-    if (firstError.includes("Unauthenticated") || firstError.includes("expired")) {
+    const firstError = (((_b = (_a = result.errors) == null ? void 0 : _a[0]) == null ? void 0 : _b.message) ?? "").toLowerCase();
+    if (firstError.includes("unauthenticated") || firstError.includes("expired") || firstError.includes("unauthorized") || firstError.includes("authentication")) {
       const refreshed = await this.refreshAuth();
       if (refreshed) {
         return this.graphql(query, variables, true);
@@ -367,17 +367,19 @@ var LensClient = class {
   }
 };
 function rawToLensPost(raw) {
-  var _a, _b, _c, _d;
+  var _a, _b;
+  const author = raw.author ?? {};
+  const commentOn = raw.commentOn;
   return {
-    id: raw.id,
+    id: raw.id ?? "",
     content: ((_a = raw.metadata) == null ? void 0 : _a.content) ?? "",
     author: {
-      address: ((_b = raw.author) == null ? void 0 : _b.address) ?? "",
-      username: (_d = (_c = raw.author) == null ? void 0 : _c.username) == null ? void 0 : _d.localName
+      address: author.address ?? "",
+      username: (_b = author.username) == null ? void 0 : _b.localName
     },
-    commentOn: raw.commentOn ? { id: raw.commentOn.id } : null,
+    commentOn: (commentOn == null ? void 0 : commentOn.id) ? { id: commentOn.id } : null,
     isDeleted: raw.isDeleted ?? false,
-    timestamp: raw.timestamp
+    timestamp: raw.timestamp ?? void 0
   };
 }
 function sleep(ms) {
@@ -877,4 +879,4 @@ var LensAgentClient = class _LensAgentClient {
 export {
   LensAgentClient
 };
-//# sourceMappingURL=lens-client-C2MTSBTA.js.map
+//# sourceMappingURL=lens-client-H5GXSDIO.js.map

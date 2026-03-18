@@ -206,8 +206,13 @@ export class LensClient {
         const result = await this.graphql(query, variables, true);
 
         // If we get an auth error, refresh and retry once
-        const firstError = result.errors?.[0]?.message ?? "";
-        if (firstError.includes("Unauthenticated") || firstError.includes("expired")) {
+        const firstError = (result.errors?.[0]?.message ?? "").toLowerCase();
+        if (
+            firstError.includes("unauthenticated") ||
+            firstError.includes("expired") ||
+            firstError.includes("unauthorized") ||
+            firstError.includes("authentication")
+        ) {
             const refreshed = await this.refreshAuth();
             if (refreshed) {
                 return this.graphql(query, variables, true);
@@ -529,20 +534,23 @@ export class LensClient {
 // ---------------------------------------------------------------------------
 
 function rawToLensPost(raw: Record<string, unknown>): LensPost {
+    const author = (raw.author ?? {}) as {
+        address?: string;
+        username?: { localName?: string };
+    };
+    const commentOn = raw.commentOn as { id?: string } | null | undefined;
+
     return {
-        id: raw.id as string,
-        content: (raw.metadata as { content?: string })?.content ?? "",
+        id: (raw.id as string) ?? "",
+        content:
+            (raw.metadata as { content?: string } | undefined)?.content ?? "",
         author: {
-            address: (raw.author as { address: string })?.address ?? "",
-            username: (
-                raw.author as { username?: { localName: string } }
-            )?.username?.localName,
+            address: author.address ?? "",
+            username: author.username?.localName,
         },
-        commentOn: raw.commentOn
-            ? { id: (raw.commentOn as { id: string }).id }
-            : null,
+        commentOn: commentOn?.id ? { id: commentOn.id } : null,
         isDeleted: (raw.isDeleted as boolean) ?? false,
-        timestamp: raw.timestamp as string | undefined,
+        timestamp: (raw.timestamp as string) ?? undefined,
     };
 }
 
